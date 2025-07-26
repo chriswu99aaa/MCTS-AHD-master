@@ -273,7 +273,7 @@ class BayesianOptimizer:
         Define the acquisition function for Bayesian optimization.
         """
 
-        num_samples = 10 
+        num_samples = 30 
         input_dim = candidate_features.shape[1]
 
         num_candidates = candidate_features.shape[0]
@@ -287,31 +287,37 @@ class BayesianOptimizer:
         else:
             optimal_inputs = torch.randn((num_samples, input_dim), dtype=torch.float32)
         
-        try:
-
-            acq_func = qPredictiveEntropySearch(
-                model=model,
-                optimal_inputs=optimal_inputs,
-                maximize=False,
-                X_pending=None,
-                max_ep_iterations=50,
-                ep_jitter=1e-6,
-                test_jitter=1e-6,
-                threshold=1e-2
-            )
-            best_candidate, _ = optimize_acqf_discrete(
-                acq_function=acq_func,
-                q = 1,
-                choices=candidate_features,
-            )
-
-            for i, candidate in enumerate(candidate_features):
-                if torch.allclose(candidate, best_candidate.squeeze(), atol=1e-6):
-                    return i
-                
-        except Exception as e:
-            print(f"Discrete optimization failed: {e}")
-            # Fallback to basic acquisition function
+        # Retry logic for qPredictiveEntropySearch with increasing jitter/threshold
+        search_success = False
+        jitter_vals = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
+        threshold_vals = [1e-2, 1e-1]
+        for jitter in jitter_vals:
+            for threshold in threshold_vals:
+                try:
+                    acq_func = qPredictiveEntropySearch(
+                        model=model,
+                        optimal_inputs=optimal_inputs,
+                        maximize=False,
+                        X_pending=None,
+                        max_ep_iterations=50,
+                        ep_jitter=jitter,
+                        test_jitter=jitter,
+                        threshold=threshold
+                    )
+                    best_candidate, _ = optimize_acqf_discrete(
+                        acq_function=acq_func,
+                        q=1,
+                        choices=candidate_features,
+                    )
+                    for i, candidate in enumerate(candidate_features):
+                        if torch.allclose(candidate, best_candidate.squeeze(), atol=1e-6):
+                            search_success = True
+                            return i
+                except Exception as e:
+                    print(f"qPredictiveEntropySearch failed with jitter={jitter}, threshold={threshold}: {e}")
+                    continue
+        if not search_success:
+            print("All qPredictiveEntropySearch attempts failed. Falling back to basic acquisition function.")
             return self._fallback_acquisition(model, candidate_features)
 
         print("No matching candidate found.")
@@ -351,62 +357,71 @@ class BayesianOptimizer:
 
     def expand(self, node: HeuristicNode):
         """
-        Expand the node by generating new heuristics based on the current node's code and action.
+        Expand the node by generating new heuristics for each action, then batch evaluate for efficiency.
         """
-        # Generate new heuristics based on the current node's code and action
-        codes = []
-        descirptions = []
-        actions = []
+        max_retries = 5
+        ABS_MAX_ALLOW = 1e12
 
         for action in self.action_types:
             if action == 'i1':
                 continue
             print(f"Generating heuristic for action: {action}")
 
-            max_retries = 5
+            candidates = []
+            # 1. 批量生成候选 code/algorithm
             for retry in range(max_retries):
                 try:
                     code, algorithm = self.bo_interface.generate_heuristic_by_action(action)
-                    
                     if self.check_duplicate_code(self.population, code):
                         print(f"Duplicate code detected for action {action}, retry {retry + 1}")
-                        continue    
-                    tour_length = self.problem.batch_evaluate([code], 0)[0]
-                
-                    # validate if the tour_length is valid
-                    ABS_MAX_ALLOW = 1e12
-                    try:
-                        val = float(tour_length)
-                    except (TypeError, ValueError):
-                        print(f"Invalid tour_length type for action {action}, retry {retry + 1}")
-                        continue  
-                                    # 过滤无效值
-                    if (not math.isfinite(val)) or val <= 0 or val > ABS_MAX_ALLOW:
-                        print(f"Invalid tour_length value {val} for action {action}, retry {retry + 1}")
                         continue
-                    
-                    # 检查目标值重复
-                    if self.check_duplicate_obj(self.population, tour_length):
-                        print(f"Duplicate objective {tour_length} detected for action {action}, retry {retry + 1}")
-                        continue     
-                                    # 成功生成有效且不重复的启发函数
-                    child = HeuristicNode(algorithm=algorithm, code=code, parent=node, action=action, tour_length=tour_length)
-                    
-                    # Calculate and cache feature vector for new child
-                    feature_vector = self.create_feature_vector(code, action)
-                    child.feature_vector = feature_vector  # Cache the feature vector
-                    
-                    node.add_child(child)
-                    self.population.append(child)
-                    self.tour_lengths.append(tour_length)
-                    
-                    print(f"Successfully generated heuristic for action {action}, tour_length: {tour_length}")
-                    break     
+                    candidates.append({'action': action, 'code': code, 'algorithm': algorithm})
+                    break  # 只要生成一个有效 code 就跳出 retry
                 except Exception as e:
                     print(f"Error generating heuristic for action {action}, retry {retry + 1}: {e}")
                     continue
-        else:
-            print(f"Failed to generate valid heuristic for action {action} after {max_retries} retries")
+            if not candidates:
+                print(f"Failed to generate candidate for action {action} after {max_retries} retries")
+                continue
+
+            # 2. 批量评估所有 code
+            codes = [c['code'] for c in candidates]
+            try:
+                tour_lengths = self.problem.batch_evaluate(codes, 0)
+            except Exception as e:
+                print(f"Batch evaluate failed for action {action}: {e}")
+                continue
+
+            # 3. 检查每个候选的有效性
+            for idx, candidate in enumerate(candidates):
+                code = candidate['code']
+                algorithm = candidate['algorithm']
+                act = candidate['action']
+                tour_length = tour_lengths[idx]
+
+                # validate if the tour_length is valid
+                try:
+                    val = float(tour_length)
+                except (TypeError, ValueError):
+                    print(f"Invalid tour_length type for action {act}")
+                    continue
+                if (not math.isfinite(val)) or val <= 0 or val > ABS_MAX_ALLOW:
+                    print(f"Invalid tour_length value {val} for action {act}")
+                    continue
+                if self.check_duplicate_obj(self.population, tour_length):
+                    print(f"Duplicate objective {tour_length} detected for action {act}")
+                    continue
+
+                # 成功生成有效且不重复的启发函数
+                child = HeuristicNode(algorithm=algorithm, code=code, parent=node, action=act, tour_length=tour_length)
+                feature_vector = self.create_feature_vector(code, act)
+                child.feature_vector = feature_vector
+                node.add_child(child)
+                self.population.append(child)
+                self.tour_lengths.append(tour_length)
+                self.X.append(feature_vector)
+                self.Y.append(tour_length)
+                print(f"Successfully generated heuristic for action {act}, tour_length: {tour_length}")
 
 
     def check_duplicate_obj(self, population, obj):
@@ -421,6 +436,11 @@ class BayesianOptimizer:
                 return True
         return False
     
+    def _get_node_feature_vector(self, node: HeuristicNode):
+        if node.feature_vector is None:
+            node.feature_vector = self.create_feature_vector(node.code, node.action)
+        return node.feature_vector
+
     def run(self):
         import json
             
@@ -444,7 +464,7 @@ class BayesianOptimizer:
             
             for node in self.population:
                 if node.tour_length is not None and node.tour_length != float('inf'):
-                    feature_vector = self.create_feature_vector(node.code, node.action)
+                    feature_vector = self._get_node_feature_vector(node)
                     candidate_features.append(torch.tensor(feature_vector, dtype=torch.float32))
                     valid_nodes.append(node)
             
